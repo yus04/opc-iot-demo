@@ -1,33 +1,65 @@
 import azure.functions as func
 import pandas as pd
 import logging
-import datetime
 import json
 import uuid
 import os
-from azure.cosmos import CosmosClient
+from io import BytesIO
+from typing import Any, Dict, List
+from openai import AzureOpenAI
+import matplotlib.pyplot as plt
+from azure.cosmos import CosmosClient, ContainerProxy
+from azure.storage.blob import BlobServiceClient
 from azure.kusto.data import KustoConnectionStringBuilder, KustoClient
 from azure.kusto.ingest import QueuedIngestClient, IngestionProperties
+from azure.core.paging import ItemPaged
+from datetime import datetime, timezone, timedelta
 
 app = func.FunctionApp()
 
 # 環境変数の取得
 COSMOS_CONNECTION_STRING = os.environ.get("COSMOS_CONNECTION_STRING")
 COSMOS_DATABASE_NAME = os.environ.get("COSMOS_DATABASE_NAME")
-COSMOS_CONTAINER_NAME = os.environ.get("COSMOS_CONTAINER_NAME")
+COSMOS_AOAI_CONTAINER_NAME = os.environ.get("COSMOS_AOAI_CONTAINER_NAME")
+COSMOS_IOT_HUB_CONTAINER_NAME = os.environ.get("COSMOS_IOT_HUB_CONTAINER_NAME")
+BLOB_CONNECTION_STRING = os.environ.get("BLOB_CONNECTION_STRING")
+BLOB_CONTAINER_NAME = os.environ.get("BLOB_CONTAINER_NAME")
 ADX_CLUSTER = os.environ.get("ADX_CLUSTER")
 ADX_DATABASE = os.environ.get("ADX_DATABASE")
 ADX_TABLE = os.environ.get("ADX_TABLE")
 KUSTO_CLIENT_ID = os.environ.get("KUSTO_CLIENT_ID")
-KUSTO_CLIENT_SECRET = os.environ.get("KUSTO_CLIDNT_SECRET")
+KUSTO_CLIENT_SECRET = os.environ.get("KUSTO_CLIENT_SECRET")
 AUTHORITY_ID = os.environ.get("AUTHORITY_ID")
+AZURE_OPENAI_SERVICE = os.environ.get("AZURE_OPENAI_SERVICE")
+AZURE_OPENAI_API_VERSION = os.getenv("AZURE_OPENAI_API_VERSION")
+AZURE_OPENAI_DEPLOYMENT = os.environ.get("AZURE_OPENAI_DEPLOYMENT")
+AZURE_OPENAI_TOKEN = os.environ.get("AZURE_OPENAI_TOKEN")
 
-# 接続設定 (Kusto クライアントの設定)
+# Kusto クライアントの設定
 kcsb = KustoConnectionStringBuilder.with_aad_application_key_authentication(
     ADX_CLUSTER, KUSTO_CLIENT_ID, KUSTO_CLIENT_SECRET, AUTHORITY_ID
 )
 kusto_client = KustoClient(kcsb)
 queued_ingest_client = QueuedIngestClient(kcsb)
+
+# AOAI クライアントの設定
+openai_client = AzureOpenAI(
+    azure_endpoint = f"https://{AZURE_OPENAI_SERVICE}.openai.azure.com",
+    api_version=AZURE_OPENAI_API_VERSION,
+    api_key = AZURE_OPENAI_TOKEN
+)
+
+# システムプロンプトの設定
+system_prompt = ""
+
+# Cosmos DB クライアントの設定
+cosmos_client = CosmosClient.from_connection_string(COSMOS_CONNECTION_STRING)
+database_client = cosmos_client.get_database_client(COSMOS_DATABASE_NAME)
+aoai_container_client = database_client.get_container_client(COSMOS_AOAI_CONTAINER_NAME)
+iot_hub_container_client = database_client.get_container_client(COSMOS_IOT_HUB_CONTAINER_NAME)
+
+# Blob Storage クライアントの設定
+blob_service_client = BlobServiceClient.from_connection_string(BLOB_CONNECTION_STRING)
 
 @app.function_name(name="eventhub_trigger")
 @app.event_hub_message_trigger(
@@ -42,7 +74,7 @@ def eventhub_trigger(azeventhub: func.EventHubEvent):
         'Python EventHub trigger processed an event: %s',
         event_message
     )
-    save_db(event_message)
+    save_db(event_message, iot_hub_container_client)
 
 
 @app.timer_trigger(
@@ -52,10 +84,11 @@ def eventhub_trigger(azeventhub: func.EventHubEvent):
     use_monitor=False
 ) 
 def timer_trigger(myTimer: func.TimerRequest) -> None:
-    if myTimer.past_due:
-        logging.info('The timer is past due!')
-
     logging.info('Python timer trigger function executed.')
+    items = read_cosmos_container(iot_hub_container_client)
+    sensor_data = extract_sensor_data(items)
+    img_buffer = create_graph_image(sensor_data)
+    save_graph_image_to_blob(img_buffer)
 
 
 @app.cosmos_db_trigger(
@@ -105,18 +138,131 @@ def cosmosdb_trigger(azcosmosdb: func.DocumentList):
         logging.error(f'Error processing document: {e}')
 
 
-def save_db(event_message: str) -> None:
+def save_db(event_message: str, container_client: ContainerProxy) -> None:
     logging.info('called save_db function.')
-    client = CosmosClient.from_connection_string(COSMOS_CONNECTION_STRING)
-    db = client.get_database_client(COSMOS_DATABASE_NAME)
-    container = db.get_container_client(COSMOS_CONTAINER_NAME)
-    dt_now_jst_aware = datetime.datetime.now(
-        datetime.timezone(datetime.timedelta(hours=9))
-    )
+    current_time = get_current_time()
     value = {
         "id": str(uuid.uuid4()),
         "partition": "1",
         "event_message": json.loads(event_message),
-        "created_at": str(dt_now_jst_aware),
+        "created_at": str(current_time),
     }
-    container.create_item(value)
+    container_client.create_item(value)
+
+
+def read_cosmos_container(container_client: ContainerProxy) -> ItemPaged[Dict[str, Any]]:
+    # 現在のUTC時刻を取得し、30分前の時刻を計算
+    current_time = get_current_time()
+    time_30_minutes_ago = current_time - timedelta(minutes=30)
+    time_30_minutes_ago_str = time_30_minutes_ago.isoformat()
+
+    # クエリの作成
+    query = f"""
+    SELECT * FROM c
+    WHERE c.created_at >= '{time_30_minutes_ago}'
+    """
+    params = [
+        {"name": "@time_30_minutes_ago", "value": time_30_minutes_ago_str}
+    ]
+
+    # クエリを実行し、結果を取得
+    items = container_client.query_items(
+        query=query,
+        parameters=params,
+        enable_cross_partition_query=True
+    )
+    return items
+
+
+def extract_sensor_data(items: ItemPaged[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    sensor_data = []
+    for item in items:
+        mapped_item = {
+            "SignalColor": item['event_message']['Messages'][0]['Payload'].get('i=7', {}).get('Value', ''),
+            "SignalMode": item['event_message']['Messages'][0]['Payload'].get('i=8', {}).get('Value', ''),
+            "Sensor1RawValue": item['event_message']['Messages'][0]['Payload'].get('i=10', {}).get('Value', ''),
+            "Sensor2RawValue": item['event_message']['Messages'][0]['Payload'].get('i=12', {}).get('Value', ''),
+            "Sensor3RawValue": item['event_message']['Messages'][0]['Payload'].get('i=14', {}).get('Value', ''),
+            "State": item['event_message']['Messages'][0]['Payload'].get('i=15', {}).get('Value', ''),
+            "created_at": item.get('created_at', '')
+        }
+        sensor_data.append(mapped_item)
+    return sensor_data
+
+
+def create_graph_image(sensor_data: List[Dict[str, Any]]) -> BytesIO:
+    # データを抽出
+    timestamps = [data['created_at'] for data in sensor_data]
+    sensor1_values = [data['Sensor1RawValue'] for data in sensor_data]
+    sensor2_values = [data['Sensor2RawValue'] for data in sensor_data]
+    sensor3_values = [data['Sensor3RawValue'] for data in sensor_data]
+
+    # グラフの作成
+    plt.figure(figsize=(10, 6))
+    plt.plot(timestamps, sensor1_values, label='Sensor1RawValue')
+    plt.plot(timestamps, sensor2_values, label='Sensor2RawValue')
+    plt.plot(timestamps, sensor3_values, label='Sensor3RawValue')
+    plt.xlabel('Timestamp')
+    plt.ylabel('Value')
+    plt.title('Sensor Data')
+    plt.legend()
+
+    # 横軸のタイムスタンプを非表示にする  
+    plt.gca().axes.get_xaxis().set_visible(False)  
+
+    # グラフをバイナリストリームに保存
+    img_buffer = BytesIO()
+    plt.savefig(img_buffer, format='png')
+    img_buffer.seek(0)
+
+    # バッファを閉じる
+    plt.close()
+
+    return img_buffer
+
+
+def save_graph_image_to_blob(img_buffer: BytesIO) -> None:
+    # blob 名の設定
+    current_time = get_current_time()
+    blob_name = current_time.strftime("%Y-%m-%d %H:%M:%S") + '.png'
+
+    # Blob にアップロード
+    blob_client = blob_service_client.get_blob_client(
+        container=BLOB_CONTAINER_NAME, blob=blob_name
+    )
+    blob_client.upload_blob(img_buffer, blob_type="BlockBlob")
+
+    # バッファを閉じる
+    img_buffer.close()
+
+
+def analyze_graph_with_aoai(image_path: str) -> str:
+    messages = [
+        {"role":"system","content": system_prompt},
+        {"role":"user","content":[
+            {
+                "type": "image_url",
+                "image_url": {
+                    "url": image_path
+                }
+            }
+        ]}
+    ]
+
+    response = openai_client.chat.completions.create(
+        model=AZURE_OPENAI_DEPLOYMENT,
+        messages=messages,
+        temperature=0.0,
+        max_tokens=1000,
+        n=1
+    )
+
+    res = response.choices[0].message.content
+    return res
+
+
+def get_current_time() -> datetime:
+    current_time = datetime.now(
+        timezone(timedelta(hours=9))
+    )
+    return current_time

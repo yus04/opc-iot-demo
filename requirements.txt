@@ -4,6 +4,9 @@
 
 azure-functions==1.19.0
 azure-cosmos==4.7.0
+azure-storage-blob==12.20.0
 azure-kusto-data==4.4.1
 azure-kusto-ingest==4.4.1
+openai==1.33.0
 pandas==2.2.2
+matplotlib==3.9.0
