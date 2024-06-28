@@ -22,6 +22,7 @@ COSMOS_CONNECTION_STRING = os.environ.get("COSMOS_CONNECTION_STRING")
 COSMOS_DATABASE_NAME = os.environ.get("COSMOS_DATABASE_NAME")
 COSMOS_AOAI_CONTAINER_NAME = os.environ.get("COSMOS_AOAI_CONTAINER_NAME")
 COSMOS_IOT_HUB_CONTAINER_NAME = os.environ.get("COSMOS_IOT_HUB_CONTAINER_NAME")
+BLOB_STORAGE_ACCOUNT = os.environ.get("BLOB_STORAGE_ACCOUNT")
 BLOB_CONNECTION_STRING = os.environ.get("BLOB_CONNECTION_STRING")
 BLOB_CONTAINER_NAME = os.environ.get("BLOB_CONTAINER_NAME")
 ADX_CLUSTER = os.environ.get("ADX_CLUSTER")
@@ -30,6 +31,7 @@ ADX_TABLE = os.environ.get("ADX_TABLE")
 KUSTO_CLIENT_ID = os.environ.get("KUSTO_CLIENT_ID")
 KUSTO_CLIENT_SECRET = os.environ.get("KUSTO_CLIENT_SECRET")
 AUTHORITY_ID = os.environ.get("AUTHORITY_ID")
+MESSAGE_TYPE = os.environ.get("MESSAGE_TYPE")
 AZURE_OPENAI_SERVICE = os.environ.get("AZURE_OPENAI_SERVICE")
 AZURE_OPENAI_API_VERSION = os.getenv("AZURE_OPENAI_API_VERSION")
 AZURE_OPENAI_DEPLOYMENT = os.environ.get("AZURE_OPENAI_DEPLOYMENT")
@@ -42,6 +44,12 @@ kcsb = KustoConnectionStringBuilder.with_aad_application_key_authentication(
 kusto_client = KustoClient(kcsb)
 queued_ingest_client = QueuedIngestClient(kcsb)
 
+# Ingestion Propertiesの設定
+ingestion_props = IngestionProperties(
+    database=ADX_DATABASE,
+    table=ADX_TABLE
+)
+
 # AOAI クライアントの設定
 openai_client = AzureOpenAI(
     azure_endpoint = f"https://{AZURE_OPENAI_SERVICE}.openai.azure.com",
@@ -50,7 +58,21 @@ openai_client = AzureOpenAI(
 )
 
 # システムプロンプトの設定
-system_prompt = ""
+system_prompt = """
+あなたはセンサーデータの時間変化のグラフから、センサーの異常検知を分析する専門家です。
+以下の情報と回答方法をもとに、回答を生成してください。
+
+## グラフの情報
+・青色はセンサー１、橙色はセンサー２，緑色はセンサー３のデータを表しています。
+・正常状態では繰り返しの波形になり、異常状態では波形の最大値や最小値が常に変化した波形になります。
+・明確に最大値や最小値が変化しない場合は、正常状態とみなしてください。
+
+## 回答方法
+・各センサーに対して、正常状態の場合は「センサーの値は正常です」と回答し、異常状態の場合は「センサーが異常を検出しました」と回答して下さい。
+・また、各センサーデータのグラフの波形から読み取って分析できることについて、３０文字程度にまとめて回答して下さい。
+・回答形式は、以下の json のフォーマットに従って下さい。
+{"sensor1_status":"", "sensor2_status":"", "sensor3_status":"", "sensor1_analysis": "", "sensor2_analysis": "", "sensor3_analysis": ""}
+"""
 
 # Cosmos DB クライアントの設定
 cosmos_client = CosmosClient.from_connection_string(COSMOS_CONNECTION_STRING)
@@ -60,6 +82,8 @@ iot_hub_container_client = database_client.get_container_client(COSMOS_IOT_HUB_C
 
 # Blob Storage クライアントの設定
 blob_service_client = BlobServiceClient.from_connection_string(BLOB_CONNECTION_STRING)
+blob_container_client = blob_service_client.get_container_client(BLOB_CONTAINER_NAME)
+container_url = BLOB_STORAGE_ACCOUNT + "/" + BLOB_CONTAINER_NAME
 
 @app.function_name(name="eventhub_trigger")
 @app.event_hub_message_trigger(
@@ -74,21 +98,53 @@ def eventhub_trigger(azeventhub: func.EventHubEvent):
         'Python EventHub trigger processed an event: %s',
         event_message
     )
-    save_db(event_message, iot_hub_container_client)
+    try:
+        save_cosmos_db(event_message, iot_hub_container_client)
+    except Exception as e:
+        logging.error(f'Error in eventhub_trigger: {e}')
 
 
 @app.timer_trigger(
-    schedule="* */5 * * * *",
+    schedule="*/10 * * * * *",
     arg_name="myTimer",
     run_on_startup=True,
     use_monitor=False
 ) 
 def timer_trigger(myTimer: func.TimerRequest) -> None:
     logging.info('Python timer trigger function executed.')
-    items = read_cosmos_container(iot_hub_container_client)
-    sensor_data = extract_sensor_data(items)
-    img_buffer = create_graph_image(sensor_data)
-    save_graph_image_to_blob(img_buffer)
+    try:
+        # blob 名の設定
+        current_time = get_current_time()
+        blob_name = current_time.strftime("%Y-%m-%d %H:%M:%S") + '.png'
+
+        # Blob Storage に保存される URL
+        image_path = container_url + "/" + blob_name
+
+        # Cosmos DB から json データの取得
+        items = read_cosmos_container(iot_hub_container_client)
+
+        # 取得した json データからセンサーデータの抽出
+        sensor_data = extract_sensor_data(items)
+
+        # センサーデータが含まれている場合
+        if len(sensor_data) > 0:
+
+            # センサーデータを昇順にソート
+            sorted_sensor_data = sorted(sensor_data, key=lambda x: x['created_at'])
+
+            # センサーデータから画像ファイルの出力
+            img_buffer = create_graph_image(sorted_sensor_data)
+
+            # 画像ファイルを保存
+            save_graph_image_to_blob(img_buffer, blob_name)
+
+            # AOAI を使った画像分析
+            analysis_result = analyze_graph_with_aoai(image_path)
+
+            # Cosmos DB への保存
+            save_cosmos_db(analysis_result, aoai_container_client)
+    except Exception as e:
+        logging.error(f'Error in timer_trigger: {e}')
 
 
 @app.cosmos_db_trigger(
@@ -96,7 +152,7 @@ def timer_trigger(myTimer: func.TimerRequest) -> None:
     container_name="aoai-container",
     database_name="iot-database",
     connection="COSMOS_CONNECTION_STRING",
-    lease_container_name="lease-container",
+    lease_container_name="aoai-lease-container",
     lease_database_name="iot-database"
 ) 
 def cosmosdb_trigger(azcosmosdb: func.DocumentList):
@@ -110,36 +166,38 @@ def cosmosdb_trigger(azcosmosdb: func.DocumentList):
             # JSON ドキュメントを Python 辞書にパース
             document_dict = json.loads(json_document)
 
+            # メッセージを取得
+            event_message = document_dict.get("event_message")
+
             # 必要なキーのみ取得
             filtered_dict = {
-                "Id": document_dict.get("Id"),
-                "AnalysisResult": document_dict.get("AnalysisResult")
+                "Id": event_message.get("Id"),
+                "Sensor1Status": event_message.get("sensor1_status"),
+                "Sensor2Status": event_message.get("sensor2_status"),
+                "Sensor3Status": event_message.get("sensor3_status"),
+                "Sensor1Analysis": event_message.get("sensor1_analysis"),
+                "Sensor2Analysis": event_message.get("sensor2_analysis"),
+                "Sensor3Analysis": event_message.get("sensor3_analysis"),
             }
 
             # Timestamp を追加
-            dt_now_jst_aware = datetime.datetime.now(
-                datetime.timezone(datetime.timedelta(hours=9))
+            dt_now_jst_aware = datetime.now(
+                timezone(timedelta(hours=9))
             )
             filtered_dict["Timestamp"] = str(dt_now_jst_aware)
 
             # json を DataFrame に変換
             df_data = pd.DataFrame([filtered_dict])
 
-            # Ingestion Propertiesの設定
-            ingestion_props = IngestionProperties(
-                database=ADX_DATABASE,
-                table=ADX_TABLE
-            )
-
             # データのインジェスト
             queued_ingest_client.ingest_from_dataframe(df_data, ingestion_properties=ingestion_props)
 
     except Exception as e:
-        logging.error(f'Error processing document: {e}')
+        logging.error(f'Error in cosmosdb_trigger: {e}')
 
 
-def save_db(event_message: str, container_client: ContainerProxy) -> None:
-    logging.info('called save_db function.')
+def save_cosmos_db(event_message: str, container_client: ContainerProxy) -> None:
+    logging.info('called save_cosmos_db function.')
     current_time = get_current_time()
     value = {
         "id": str(uuid.uuid4()),
@@ -153,16 +211,21 @@ def save_db(event_message: str, container_client: ContainerProxy) -> None:
 def read_cosmos_container(container_client: ContainerProxy) -> ItemPaged[Dict[str, Any]]:
     # 現在のUTC時刻を取得し、30分前の時刻を計算
     current_time = get_current_time()
-    time_30_minutes_ago = current_time - timedelta(minutes=30)
-    time_30_minutes_ago_str = time_30_minutes_ago.isoformat()
+    time_5_minutes_ago = current_time - timedelta(minutes=5)
+    time_5_minutes_ago_str = time_5_minutes_ago.isoformat()
 
     # クエリの作成
     query = f"""
-    SELECT * FROM c
-    WHERE c.created_at >= '{time_30_minutes_ago}'
+    SELECT TOP 30 * 
+    FROM c 
+    WHERE c.event_message.MessageType = '{MESSAGE_TYPE}' 
+    AND c.created_at >= '{time_5_minutes_ago}' 
+    ORDER BY c.created_at DESC
     """
+
+    # パラメーターの設定
     params = [
-        {"name": "@time_30_minutes_ago", "value": time_30_minutes_ago_str}
+        {"name": "@time_5_minutes_ago", "value": time_5_minutes_ago_str}
     ]
 
     # クエリを実行し、結果を取得
@@ -221,16 +284,9 @@ def create_graph_image(sensor_data: List[Dict[str, Any]]) -> BytesIO:
     return img_buffer
 
 
-def save_graph_image_to_blob(img_buffer: BytesIO) -> None:
-    # blob 名の設定
-    current_time = get_current_time()
-    blob_name = current_time.strftime("%Y-%m-%d %H:%M:%S") + '.png'
-
+def save_graph_image_to_blob(img_buffer: BytesIO, blob_name: str) -> None:
     # Blob にアップロード
-    blob_client = blob_service_client.get_blob_client(
-        container=BLOB_CONTAINER_NAME, blob=blob_name
-    )
-    blob_client.upload_blob(img_buffer, blob_type="BlockBlob")
+    blob_container_client.upload_blob(name=blob_name, data=img_buffer, blob_type="BlockBlob")
 
     # バッファを閉じる
     img_buffer.close()
