@@ -141,8 +141,13 @@ def timer_trigger(myTimer: func.TimerRequest) -> None:
             # AOAI を使った画像分析
             analysis_result = analyze_graph_with_aoai(image_path)
 
+            # Id と PublisherId の追加
+            analysis_result['Id'] = sensor_data[0].get('Id', '')
+            analysis_result['PublisherId'] = sensor_data[0].get('PublisherId', '')
+            analysis_result_str = json.dumps(analysis_result)
+
             # Cosmos DB への保存
-            save_cosmos_db(analysis_result, aoai_container_client)
+            save_cosmos_db(analysis_result_str, aoai_container_client)
     except Exception as e:
         logging.error(f'Error in timer_trigger: {e}')
 
@@ -172,6 +177,7 @@ def cosmosdb_trigger(azcosmosdb: func.DocumentList):
             # 必要なキーのみ取得
             filtered_dict = {
                 "Id": event_message.get("Id"),
+                "PublisherId": event_message.get("PublisherId"),
                 "Sensor1Status": event_message.get("sensor1_status"),
                 "Sensor2Status": event_message.get("sensor2_status"),
                 "Sensor3Status": event_message.get("sensor3_status"),
@@ -241,6 +247,8 @@ def extract_sensor_data(items: ItemPaged[Dict[str, Any]]) -> List[Dict[str, Any]
     sensor_data = []
     for item in items:
         mapped_item = {
+            "Id": item.get('id', ''),
+            "PublisherId": item['event_message'].get('PublisherId', ''),
             "SignalColor": item['event_message']['Messages'][0]['Payload'].get('i=7', {}).get('Value', ''),
             "SignalMode": item['event_message']['Messages'][0]['Payload'].get('i=8', {}).get('Value', ''),
             "Sensor1RawValue": item['event_message']['Messages'][0]['Payload'].get('i=10', {}).get('Value', ''),
@@ -292,7 +300,7 @@ def save_graph_image_to_blob(img_buffer: BytesIO, blob_name: str) -> None:
     img_buffer.close()
 
 
-def analyze_graph_with_aoai(image_path: str) -> str:
+def analyze_graph_with_aoai(image_path: str) -> dict:
     messages = [
         {"role":"system","content": system_prompt},
         {"role":"user","content":[
@@ -314,7 +322,8 @@ def analyze_graph_with_aoai(image_path: str) -> str:
     )
 
     res = response.choices[0].message.content
-    return res
+    res_dict = json.loads(res)
+    return res_dict
 
 
 def get_current_time() -> datetime:
